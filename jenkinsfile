@@ -1,0 +1,173 @@
+pipeline {
+    // Changed to 'any' so it executes cleanly on your single master Jenkins EC2 instance
+    agent any
+
+    triggers {
+        githubPush()
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        AWS_REGION = 'ap-south-2'
+
+        // 1. TODO: Replace with your actual S3 bucket name
+        ARTIFACT_BUCKET = 'dev-app-artifacts-ninad2026'
+
+        // 2. TODO: Replace with your actual Ubuntu EC2 Instance ID
+        INSTANCE_A = 'i-0a4ba827a1df01176'
+        
+        // 3. TODO: Replace with your actual Amazon Linux EC2 Instance ID
+        INSTANCE_B = 'i-025434b6048789375'
+
+        // 4. TODO: Replace with your actual Application Load Balancer DNS URL
+        ALB_URL = 'http://alb-dev-public-487755323.ap-south-2.elb.amazonaws.com'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build and Test') {
+            steps {
+                // Uses the global Maven profile we checked via terminal earlier
+                sh 'mvn -B clean verify'
+            }
+        }
+
+        stage('Archive Artifact') {
+            steps {
+                archiveArtifacts(
+                    artifacts: 'target/devops-demo-app.jar',
+                    fingerprint: true
+                )
+            }
+        }
+
+        stage('Upload Artifact to S3') {
+            steps {
+                sh '''
+                    aws s3 cp target/devops-demo-app.jar \
+                    s3://${ARTIFACT_BUCKET}/build-${BUILD_NUMBER}/devops-demo-app.jar \
+                    --region ${AWS_REGION}
+                '''
+            }
+        }
+
+        stage('Deploy to Both EC2 Instances') {
+            steps {
+                script {
+                    def commands = [
+                        'set -e',
+                        "aws s3 cp s3://${env.ARTIFACT_BUCKET}/build-${env.BUILD_NUMBER}/devops-demo-app.jar /tmp/app.jar --region ${env.AWS_REGION}",
+                        'install -o appuser -g appuser -m 0644 /tmp/app.jar /opt/demo-app/app.jar',
+                        'systemctl restart demo-app',
+                        'systemctl is-active --quiet demo-app',
+                        'curl -fsS http://127.0.0.1:8080/health'
+                    ]
+
+                    writeFile(
+                        file: 'ssm-params.json',
+                        text: groovy.json.JsonOutput.toJson([commands: commands])
+                    )
+
+                    def commandId = sh(
+                        script: """
+                            aws ssm send-command \
+                            --region ${AWS_REGION} \
+                            --instance-ids ${INSTANCE_A} ${INSTANCE_B} \
+                            --document-name AWS-RunShellScript \
+                            --parameters file://ssm-params.json \
+                            --query 'Command.CommandId' \
+                            --output text
+                        """,
+                        returnStdout: true
+                    ).trim()
+
+                    echo "SSM Command ID: ${commandId}"
+
+                    timeout(time: 10, unit: 'MINUTES') {
+                        waitUntil {
+                            def result = sh(
+                                script: """
+                                    aws ssm list-command-invocations \
+                                    --region ${AWS_REGION} \
+                                    --command-id ${commandId} \
+                                    --details \
+                                    --query 'CommandInvocations[].Status' \
+                                    --output text
+                                """,
+                                returnStdout: true
+                            ).trim()
+
+                            def statuses = result.tokenize()
+
+                            if (statuses.any {
+                                it in [
+                                    'Failed',
+                                    'Cancelled',
+                                    'TimedOut',
+                                    'DeliveryTimedOut',
+                                    'ExecutionTimedOut',
+                                    'Undeliverable',
+                                    'Terminated'
+                                ]
+                            }) {
+                                error("EC2 deployment failed: ${statuses}")
+                            }
+
+                            return statuses.size() == 2 && statuses.every { it == 'Success' }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Test through ALB') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking ALB health..."
+                    for i in $(seq 1 18); do
+                        if curl -fsS "${ALB_URL}/health"; then
+                            break
+                        fi
+                        sleep 10
+                    done
+
+                    echo "Checking application 1..."
+                    curl -fsS "${ALB_URL}/webserver1.html" | grep -F "Welcome to application 1"
+
+                    echo "Checking application 2..."
+                    curl -fsS "${ALB_URL}/webserver2.html" | grep -F "Welcome to application 2"
+
+                    echo "Checking invalid URL..."
+                    STATUS=$(curl -sS -o /tmp/invalid.txt -w "%{http_code}" "${ALB_URL}/invalid-path")
+                    test "$STATUS" = "503"
+                    grep -F "invalid path" /tmp/invalid.txt
+
+                    echo "ALL CHECKS PASSED"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Application deployed successfully!'
+        }
+        failure {
+            echo 'Deployment failed. Check console logs.'
+        }
+        always {
+            echo 'Pipeline execution completed.'
+        }
+    }
+}
